@@ -4,6 +4,7 @@
 *)
 
 open Printf;;
+open Unix;;
 
 type id_pair = string;;
 type seqno = int;;
@@ -27,7 +28,7 @@ let buffer_add_octet buf n nb_octet =
   done
 ;;
 
-let buffer_add_ip_pair buf id_pair =
+let buffer_add_id_pair buf id_pair =
   Buffer.add_string buf id_pair
 ;;
 
@@ -62,7 +63,7 @@ let rec make_TLV tlv =
       neighbour_l
   |Data(seqno, id_pair, data_block_l) ->
     let tlv_data_block = Buffer.create 2 in
-    List.iter (fun buf tlv -> Buffer.add_buffer buf (make_TLV tlv)) data_block_l;
+    List.iter (fun tlv -> Buffer.add_buffer tlv_data_block (make_TLV tlv)) data_block_l;
     Buffer.add_char out (char_of_int 5);
     Buffer.add_char out (char_of_int (12 + (Buffer.length tlv_data_block)));
     buffer_add_seqno out seqno;
@@ -75,7 +76,7 @@ let rec make_TLV tlv =
     buffer_add_id_pair out id_pair
   |TLV_Data(nb_tlv, data_block) ->
     Buffer.add_char out (char_of_int nb_tlv);
-    Buffer.add_string out data_block)
+    Buffer.add_string out data_block);
   out
 ;;
 
@@ -83,10 +84,23 @@ let make_pack id tlv_l =
   let body = Buffer.create 2 in
   List.iter (fun tlv -> Buffer.add_buffer body (make_TLV tlv)) tlv_l;
   let out = Buffer.create 14 in
-  Buffer.add_char out 57;
-  Buffer.add_char out 0;
+  Buffer.add_char out (char_of_int 57);
+  Buffer.add_char out (char_of_int 0);
   buffer_add_octet out (Buffer.length body) 2;
   buffer_add_id_pair out id;
   Buffer.add_buffer out body;
   out
+;;
+
+
+
+(* MAIN *)
+
+let _ =
+  let sock = socket PF_INET SOCK_DGRAM 0 in
+  setsockopt sock SO_REUSEADDR true;
+  let addr = inet_addr_of_string "81.194.27.155" in
+  let port = 1212 in
+  let sin = ADDR_INET(addr, port) in
+  sendto sock (Bytes.of_string "Hello") 0 5 [MSG_PEEK] sin
 ;;
