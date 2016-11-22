@@ -31,6 +31,17 @@ let host_id =
 
 let host_id = Bytes.of_string "AAAAAAAA";;
 
+let host_seqno = ref 0;;
+
+let host_data = ref ("ASSOUAD");;
+
+let host_data_tbl = Hashtbl.create 10;;
+Hashtbl.add host_data_tbl host_id (!host_seqno, !host_data, Sys.time ());;
+
+let host_pot_neigh = ref ["81.194.27.155"];;
+let host_uni_neigh = ref [];;
+let host_sym_neigh = ref [];;
+
 let buffer_add_octet buf n nb_octet =
   let tmp = ref n in
   for i = 1 to nb_octet do
