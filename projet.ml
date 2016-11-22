@@ -20,6 +20,17 @@ type tlv_type =
   |TLV_Data of int * string
 ;;
 
+(*Random.self_init ();;
+let host_id =
+  let value = Bytes.create 8 in
+  for i = 0 to 7 do
+    Bytes.set value i (char_of_int (65 + Random.int 40))
+  done;
+  value
+;;*)
+
+let host_id = Bytes.of_string "AAAAAAAA";;
+
 let buffer_add_octet buf n nb_octet =
   let tmp = ref n in
   for i = 1 to nb_octet do
@@ -92,7 +103,14 @@ let make_pack id tlv_l =
   out
 ;;
 
-
+let send_pack sock sin id tlv_l =
+  let pack = make_pack id tlv_l in
+  let data = Buffer.to_bytes pack in
+  let data_len = Bytes.length data in
+  let nb_bytes_written = sendto sock data 0 data_len [MSG_PEEK] sin in
+  if nb_bytes_written <> data_len then
+    assert false
+;;
 
 (* MAIN *)
 
@@ -102,5 +120,7 @@ let _ =
   let addr = inet_addr_of_string "81.194.27.155" in
   let port = 1212 in
   let sin = ADDR_INET(addr, port) in
-  sendto sock (Bytes.of_string "Hello") 0 5 [MSG_PEEK] sin
+  printf "%s\n" host_id;
+  let tvl_l = [Pad0] in
+  send_pack sock sin host_id tvl_l
 ;;
