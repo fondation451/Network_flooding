@@ -6,6 +6,8 @@
 open Printf;;
 open Unix;;
 
+exception Paquet_Non_Conforme of string;;
+
 type id_pair = string;;
 type seqno = int;;
 
@@ -19,6 +21,10 @@ type tlv_type =
   |IHave of seqno * id_pair
   |TLV_Data of int * string
 ;;
+
+let port_protocol = 1212;;
+
+let char_of = char_of_int;;
 
 (*Random.self_init ();;
 let host_id =
@@ -35,17 +41,16 @@ let host_seqno = ref 0;;
 
 let host_data = ref ("ASSOUAD");;
 
-let host_data_tbl = Hashtbl.create 10;;
-Hashtbl.add host_data_tbl host_id (!host_seqno, !host_data, Sys.time ());;
+let host_data_tbl = ref [(host_id, !host_seqno, !host_data, Sys.time ())];;
 
-let host_pot_neigh = ref ["81.194.27.155"];;
+let host_pot_neigh = ref [("81.194.27.155", None, None)];;
 let host_uni_neigh = ref [];;
 let host_sym_neigh = ref [];;
 
 let buffer_add_octet buf n nb_octet =
   let tmp = ref n in
   for i = 1 to nb_octet do
-    Buffer.add_char buf (char_of_int (!tmp mod 8));
+    Buffer.add_char buf (char_of (!tmp mod 8));
     tmp := !tmp / 8
   done
 ;;
@@ -58,25 +63,35 @@ let buffer_add_seqno buf seqno =
   buffer_add_octet buf seqno 4
 ;;
 
+let make_int_from_bytes b i l =
+  let out = ref 0 in
+  let acc = ref 1 in
+  for k = i to i+l-1 do
+    out := !out + (int_of_char (Bytes.get b k)) * !acc;
+    acc := !acc * 256
+  done;
+  !out
+;;
+
 let rec make_TLV tlv =
   let out = Buffer.create 2 in
   (match tlv with
-  |Pad0 -> Buffer.add_char out (char_of_int 0)
+  |Pad0 -> Buffer.add_char out (char_of 0)
   |PadN(nb_MBZ) ->
-    Buffer.add_char out (char_of_int 1);
-    Buffer.add_char out (char_of_int nb_MBZ);
+    Buffer.add_char out (char_of 1);
+    Buffer.add_char out (char_of nb_MBZ);
     for i = 1 to nb_MBZ do
-      Buffer.add_char out (char_of_int 0)
+      Buffer.add_char out (char_of 0)
     done
   |IHU(id_pair) ->
-    Buffer.add_char out (char_of_int 2);
+    Buffer.add_char out (char_of 2);
     buffer_add_id_pair out id_pair
   |Neighbour_Request ->
-    Buffer.add_char out (char_of_int 3);
-    Buffer.add_char out (char_of_int 0)
+    Buffer.add_char out (char_of 3);
+    Buffer.add_char out (char_of 0)
   |Neighbour(neighbour_l) ->
-    Buffer.add_char out (char_of_int 4);
-    Buffer.add_char out (char_of_int ((List.length neighbour_l) * 26)); (* id+ip+port = 26 octets  *)
+    Buffer.add_char out (char_of 4);
+    Buffer.add_char out (char_of ((List.length neighbour_l) * 26)); (* id+ip+port = 26 octets  *)
     List.iter
       (fun (id_pair, ip_pair, port) ->
         buffer_add_id_pair out id_pair;
@@ -86,18 +101,18 @@ let rec make_TLV tlv =
   |Data(seqno, id_pair, data_block_l) ->
     let tlv_data_block = Buffer.create 2 in
     List.iter (fun tlv -> Buffer.add_buffer tlv_data_block (make_TLV tlv)) data_block_l;
-    Buffer.add_char out (char_of_int 5);
-    Buffer.add_char out (char_of_int (12 + (Buffer.length tlv_data_block)));
+    Buffer.add_char out (char_of 5);
+    Buffer.add_char out (char_of (12 + (Buffer.length tlv_data_block)));
     buffer_add_seqno out seqno;
     buffer_add_id_pair out id_pair;
     Buffer.add_buffer out tlv_data_block
   |IHave(seqno, id_pair) ->
-    Buffer.add_char out (char_of_int 6);
-    Buffer.add_char out (char_of_int 12);
+    Buffer.add_char out (char_of 6);
+    Buffer.add_char out (char_of 12);
     buffer_add_seqno out seqno;
     buffer_add_id_pair out id_pair
   |TLV_Data(nb_tlv, data_block) ->
-    Buffer.add_char out (char_of_int nb_tlv);
+    Buffer.add_char out (char_of nb_tlv);
     Buffer.add_string out data_block);
   out
 ;;
@@ -106,8 +121,8 @@ let make_pack id tlv_l =
   let body = Buffer.create 2 in
   List.iter (fun tlv -> Buffer.add_buffer body (make_TLV tlv)) tlv_l;
   let out = Buffer.create 14 in
-  Buffer.add_char out (char_of_int 57);
-  Buffer.add_char out (char_of_int 0);
+  Buffer.add_char out (char_of 57);
+  Buffer.add_char out (char_of 0);
   buffer_add_octet out (Buffer.length body) 2;
   buffer_add_id_pair out id;
   Buffer.add_buffer out body;
@@ -123,7 +138,99 @@ let send_pack sock sin id tlv_l =
     assert false
 ;;
 
+let rec send_pack_l sock neigh tlv_l =
+  match neigh with
+  |[] -> ()
+  |h::t ->
+    let (ip, _, _) = h in
+    let addr = inet_addr_of_string ip in
+    let sin = ADDR_INET(addr, port_protocol) in
+    send_pack sock sin host_id tlv_l;
+    send_pack_l sock t tlv_l
+;;
+
+
+let rec interpret_body pack pos pack_len =
+  let end_of_pack = pos + pack_len in
+  let rec aux pos out =
+    if pos >= end_of_pack then
+      out
+    else begin
+      match int_of_char (Bytes.get pack pos) with
+      |0 -> aux (pos+1) (Pad0::out)
+      |n -> begin
+        let tlv_len = make_int_from_bytes pack (pos+1) 1 in
+        match n with
+        |1 ->
+          aux (pos+2+tlv_len) ((PadN(tlv_len))::out)
+        |2 ->
+          let id_pair = Bytes.sub_string pack (pos+2) 8 in
+          aux (pos+10) ((IHU(id_pair))::out)
+        |3 -> aux (pos+2+tlv_len) (Neighbour_Request::out)
+        |4 ->
+          if tlv_len mod 28 <> 0 then
+            raise (Paquet_Non_Conforme(sprintf "Taille TLV Neighbours non valide : %d mod <> 0" tlv_len));
+          let neigh_l = ref [] in
+          let compt = ref 0 in
+          while !compt < tlv_len do
+            let id_pair = Bytes.sub_string pack (pos+2+!compt) 8 in
+            let ip_pair = Bytes.sub_string pack (pos+2+!compt+8) 16 in
+            let port_pair = make_int_from_bytes pack (pos+2+!compt+24) 2 in
+            compt := !compt + 28;
+            neigh_l := ((id_pair, ip_pair, port_pair)::(!neigh_l))
+          done;
+          aux (pos+2+tlv_len) ((Neighbour(!neigh_l))::out)
+        |5 ->
+          let seqno_data = make_int_from_bytes pack (pos+2) 4 in
+          let id_pair = Bytew.sub_string pack (pos+6) 8 in
+          let data_TLV = interpret_body pack (pos+14) (tlv_len - 12) in
+          aux (pos+2+tlv_len) ((Data(seqno_data, id_pair, data_TLV))::out)
+        |6 ->
+          let seqno_data = make_int_from_bytes pack (pos+2) 4 in
+          let id_pair = Bytes.sub_string pack (pos+6) 8 in
+          aux (pos+2+tlv_len) ((IHave(seqno_data, id_pair))::out)
+        |n ->
+          let data = Bytes.sub_string pack (pos+2) tlv_len in
+          aux (pos+2+tlv_len) ((TLV_Data(n, data))::out)
+      end
+    end
+  in
+  aux pos []
+;;
+
+let interpret_pack pack =
+  if Bytes.get pack 0 <> (char_of 57) then
+    raise (Paquet_Non_Conforme("Erreur champs Magic"))
+  else if Bytes.get pack 1 <> (char_of 0) then
+    raise (Paquet_Non_Conforme("Erreur champs Version"))
+  else
+    let pack_len = make_int_from_bytes pack 2 2 in
+    let src_id = Bytes.sub_string pack 4 8 in
+    (src_id, interpret_body pack 12 pack_len)
+;;
+
+
 (* MAIN *)
+
+
+let send_empty_pack_sevice sock =
+  send_pack_l sock !host_sym_neigh [];
+  send_pack_l sock !host_uni_neigh [];
+  if List.length host_sym_neigh < 5 then
+    send_pack_l sock [pick_random !host_pot_neigh] []
+;;
+
+let send_IHU_service sock =
+  send_pack_l sock !host_sym_neigh [IHU(host_id)];
+  send_pack_l sock !host_uni_neigh [IHU(host_id)]
+;;
+
+let send_service sock compt =
+  if compt mod 30 = 0 then
+    send_empty_pack_service sock
+  else if compt mod 90 = 0 then
+    send_IHU_service sock
+;;
 
 let _ =
   let sock = socket PF_INET SOCK_DGRAM 0 in
