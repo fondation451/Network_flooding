@@ -10,6 +10,7 @@ exception Paquet_Non_Conforme of string;;
 
 type id_pair = string;;
 type seqno = int;;
+type neighbour = string * float option * float option;;
 
 type tlv_type =
   |Pad0
@@ -23,6 +24,10 @@ type tlv_type =
 ;;
 
 let port_protocol = 1212;;
+let udp_max_len = 5000;;
+let timeout_uni_neigh = 100.0;;
+let timeout_sym_neigh = 150.0;;
+let timeout_sym_neigh_IHU = 300.0;;
 
 let char_of = char_of_int;;
 
@@ -43,9 +48,48 @@ let host_data = ref ("ASSOUAD");;
 
 let host_data_tbl = ref [(host_id, !host_seqno, !host_data, Sys.time ())];;
 
-let host_pot_neigh = ref [("81.194.27.155", None, None)];;
-let host_uni_neigh = ref [];;
-let host_sym_neigh = ref [];;
+let host_pot_neigh : neighbour list ref = ref [("81.194.27.155", None, None)];;
+let host_uni_neigh : neighbour list ref = ref [];;
+let host_sym_neigh : neighbour list ref = ref [];;
+
+let is_in_neigh ip neigh_l = List.exists (fun (ip_neigh, _, _) -> ip_neigh = ip) neigh_l;;
+let remove_neigh ip neigh_l = List.find_all (fun (ip_neigh, _, _) -> ip_neigh <> ip) neigh_l;;
+let update_neigh ip t1 t2 neigh_l = (ip, t1, t2)::(remove_neigh ip neigh_l);;
+
+let maintain_uni_neigh () =
+  let curr_t = Sys.time () in
+  host_uni_neigh :=
+    List.find_all
+      (fun (ip_neigh, t1, t2) ->
+        match t1 with
+        |Some(neigh_t) -> curr_t <= neigh_t +. timeout_uni_neigh
+        |_ -> false)
+      !host_uni_neigh
+;;
+
+let maintain_sym_neigh () =
+  let curr_t = Sys.time () in
+  host_sym_neigh :=
+    List.find_all
+      (fun (ip_neigh, t1, t2) ->
+        match t1, t2 with
+        |Some(neigh_t), Some(neigh_t_IHU) ->
+          curr_t <= neigh_t +. timeout_sym_neigh &&
+          curr_t <= neigh_t_IHU +. timeout_sym_neigh_IHU
+        |_ -> false)
+      !host_sym_neigh
+;;
+
+let maintain_neigh () =
+  maintain_uni_neigh ();
+  maintain_sym_neigh ()
+;;
+
+let pick_random l =
+  let len = List.length l in
+  let ind = Random.int len in
+  List.nth l ind
+;;
 
 let buffer_add_octet buf n nb_octet =
   let tmp = ref n in
@@ -173,16 +217,16 @@ let rec interpret_body pack pos pack_len =
           let neigh_l = ref [] in
           let compt = ref 0 in
           while !compt < tlv_len do
-            let id_pair = Bytes.sub_string pack (pos+2+!compt) 8 in
-            let ip_pair = Bytes.sub_string pack (pos+2+!compt+8) 16 in
-            let port_pair = make_int_from_bytes pack (pos+2+!compt+24) 2 in
+            let id_pair = Bytes.sub_string pack (pos+2+ !compt) 8 in
+            let ip_pair = Bytes.sub_string pack (pos+2+ !compt+8) 16 in
+            let port_pair = make_int_from_bytes pack (pos+2+ !compt+24) 2 in
             compt := !compt + 28;
             neigh_l := ((id_pair, ip_pair, port_pair)::(!neigh_l))
           done;
           aux (pos+2+tlv_len) ((Neighbour(!neigh_l))::out)
         |5 ->
           let seqno_data = make_int_from_bytes pack (pos+2) 4 in
-          let id_pair = Bytew.sub_string pack (pos+6) 8 in
+          let id_pair = Bytes.sub_string pack (pos+6) 8 in
           let data_TLV = interpret_body pack (pos+14) (tlv_len - 12) in
           aux (pos+2+tlv_len) ((Data(seqno_data, id_pair, data_TLV))::out)
         |6 ->
@@ -213,10 +257,10 @@ let interpret_pack pack =
 (* MAIN *)
 
 
-let send_empty_pack_sevice sock =
+let send_empty_pack_service sock =
   send_pack_l sock !host_sym_neigh [];
   send_pack_l sock !host_uni_neigh [];
-  if List.length host_sym_neigh < 5 then
+  if List.length !host_sym_neigh < 5 then
     send_pack_l sock [pick_random !host_pot_neigh] []
 ;;
 
@@ -230,6 +274,37 @@ let send_service sock compt =
     send_empty_pack_service sock
   else if compt mod 90 = 0 then
     send_IHU_service sock
+;;
+
+let update_uni_neigh src_ip t =
+  if not (is_in_neigh src_ip !host_uni_neigh && is_in_neigh src_ip !host_sym_neigh) then
+    host_pot_neigh := remove_neigh src_ip !host_pot_neigh;
+  host_uni_neigh := update_neigh src_ip (Some(t)) None !host_uni_neigh
+;;
+
+let update_sym_neigh src_ip body t =
+  if List.exists (fun tlv -> tlv = IHU(host_id)) body &&
+     not (is_in_neigh src_ip !host_sym_neigh) then begin
+    host_pot_neigh := remove_neigh src_ip !host_pot_neigh;
+    host_uni_neigh := remove_neigh src_ip !host_uni_neigh
+  end;
+  host_sym_neigh := update_neigh src_ip (Some(t)) (Some(t)) !host_sym_neigh
+;;
+
+let handle_pack src_ip src_id body t =
+  update_uni_neigh src_ip t;
+  update_sym_neigh src_ip body t
+;;
+
+let recv_service sock =
+  let pack = Bytes.create udp_max_len in
+  match recvfrom sock pack 0 udp_max_len [MSG_PEEK] with
+  |len, ADDR_INET(addr, port) ->
+    let t = Sys.time () in
+    let src_ip = string_of_inet_addr addr in
+    let (src_id, body) = interpret_pack pack in
+    handle_pack src_ip src_id body t
+  |_ -> assert false
 ;;
 
 let _ =
