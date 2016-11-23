@@ -10,14 +10,15 @@ exception Paquet_Non_Conforme of string;;
 
 type id_pair = string;;
 type seqno = int;;
-type neighbour = string * float option * float option;;
+type neigbour_info = id_pair * string * int;; (* ID * IP * Port *)
+type neighbour = neigbour_info * float option * float option;;
 
 type tlv_type =
   |Pad0
   |PadN of int (* Nombre de zero du MBZ *)
   |IHU of id_pair
   |Neighbour_Request
-  |Neighbour of (id_pair * string * int) list
+  |Neighbour of neigbour_info list
   |Data of seqno * id_pair * tlv_type list
   |IHave of seqno * id_pair
   |TLV_Data of int * string
@@ -25,9 +26,14 @@ type tlv_type =
 
 let port_protocol = 1212;;
 let udp_max_len = 5000;;
+let timeout_empty = 30.0;;
+let timeout_IHU = 90.0;;
+let timeout_neighbour_request = 180.0;;
 let timeout_uni_neigh = 100.0;;
 let timeout_sym_neigh = 150.0;;
 let timeout_sym_neigh_IHU = 300.0;;
+let timeout_data_maintain = 600.0;;
+let timeout_data = 2100.0;;
 
 let char_of = char_of_int;;
 
@@ -48,13 +54,19 @@ let host_data = ref ("ASSOUAD");;
 
 let host_data_tbl = ref [(host_id, !host_seqno, !host_data, Sys.time ())];;
 
-let host_pot_neigh : neighbour list ref = ref [("81.194.27.155", None, None)];;
+let host_pot_neigh : neighbour list ref = ref [((host_id, "81.194.27.155", port_protocol), None, None)];;
 let host_uni_neigh : neighbour list ref = ref [];;
 let host_sym_neigh : neighbour list ref = ref [];;
 
-let is_in_neigh ip neigh_l = List.exists (fun (ip_neigh, _, _) -> ip_neigh = ip) neigh_l;;
-let remove_neigh ip neigh_l = List.find_all (fun (ip_neigh, _, _) -> ip_neigh <> ip) neigh_l;;
-let update_neigh ip t1 t2 neigh_l = (ip, t1, t2)::(remove_neigh ip neigh_l);;
+let is_in_neigh ip neigh_l = List.exists (fun ((_, ip_neigh, _), _, _) -> ip_neigh = ip) neigh_l;;
+let remove_neigh ip id port neigh_l =
+  List.find_all
+    (fun ((id_neigh, ip_neigh, port_neigh), _, _) ->
+      ip_neigh <> ip ||
+      id_neigh <> id ||
+      port_neigh <> port)
+    neigh_l;;
+let update_neigh ip id port t1 t2 neigh_l = ((id, ip, port), t1, t2)::(remove_neigh ip id port neigh_l);;
 
 let maintain_uni_neigh () =
   let curr_t = Sys.time () in
@@ -90,6 +102,15 @@ let pick_random l =
   let ind = Random.int len in
   List.nth l ind
 ;;
+
+let pick_random_n l n =
+  if l = [] then
+    []
+  else
+    [List.hd l]
+;;
+
+let make_neighbourg ip id = ((id, ip, port_protocol), None, None);;
 
 let buffer_add_octet buf n nb_octet =
   let tmp = ref n in
@@ -186,9 +207,9 @@ let rec send_pack_l sock neigh tlv_l =
   match neigh with
   |[] -> ()
   |h::t ->
-    let (ip, _, _) = h in
+    let ((id, ip, port), _, _) = h in
     let addr = inet_addr_of_string ip in
-    let sin = ADDR_INET(addr, port_protocol) in
+    let sin = ADDR_INET(addr, port) in
     send_pack sock sin host_id tlv_l;
     send_pack_l sock t tlv_l
 ;;
@@ -269,31 +290,78 @@ let send_IHU_service sock =
   send_pack_l sock !host_uni_neigh [IHU(host_id)]
 ;;
 
-let send_service sock compt =
-  if compt mod 30 = 0 then
-    send_empty_pack_service sock
-  else if compt mod 90 = 0 then
-    send_IHU_service sock
+let send_neighbour_request_service sock =
+  let neigh = pick_random !host_sym_neigh in
+  send_pack_l sock [neigh] [Neighbour_Request]
 ;;
 
-let update_uni_neigh src_ip t =
+let send_service sock t_empty t_IHU t_neigh_request =
+  let curr_t = Sys.time () in
+  let new_t_empty =
+    if curr_t >= t_empty +. timeout_empty then begin
+      send_empty_pack_service sock;
+      curr_t
+    end else
+      t_empty
+  in
+  let new_t_IHU =
+    if curr_t >= t_IHU +. timeout_IHU then begin
+      send_IHU_service sock;
+      curr_t
+    end else
+      t_IHU
+  in
+  let new_t_neigh_request =
+    if curr_t >= t_neigh_request +. timeout_neighbour_request && List.length !host_pot_neigh < 5 then begin
+      send_neighbour_request_service sock;
+      curr_t
+    end else
+      t_neigh_request
+  in
+  (new_t_empty, new_t_IHU, new_t_neigh_request)
+;;
+
+let update_uni_neigh src_ip src_id src_port t =
   if not (is_in_neigh src_ip !host_uni_neigh && is_in_neigh src_ip !host_sym_neigh) then
-    host_pot_neigh := remove_neigh src_ip !host_pot_neigh;
-  host_uni_neigh := update_neigh src_ip (Some(t)) None !host_uni_neigh
+    host_pot_neigh := remove_neigh src_ip src_id src_port !host_pot_neigh;
+  host_uni_neigh := update_neigh src_ip src_id src_port (Some(t)) None !host_uni_neigh
 ;;
 
-let update_sym_neigh src_ip body t =
-  if List.exists (fun tlv -> tlv = IHU(host_id)) body &&
-     not (is_in_neigh src_ip !host_sym_neigh) then begin
-    host_pot_neigh := remove_neigh src_ip !host_pot_neigh;
-    host_uni_neigh := remove_neigh src_ip !host_uni_neigh
-  end;
-  host_sym_neigh := update_neigh src_ip (Some(t)) (Some(t)) !host_sym_neigh
+let handle_tlv sock src_ip src_id src_port tlv t =
+  match tlv with
+  |Pad0 -> ()
+  |PadN(_) -> ()
+  |IHU(id) ->
+    if not (is_in_neigh src_ip !host_sym_neigh) then begin
+      host_pot_neigh := remove_neigh src_ip src_id src_port !host_pot_neigh;
+      host_uni_neigh := remove_neigh src_ip src_id src_port !host_uni_neigh
+    end;
+    host_sym_neigh := update_neigh src_ip src_id src_port (Some(t)) (Some(t)) !host_sym_neigh
+  |Neighbour_Request ->
+    let neigh_l = pick_random_n !host_sym_neigh 5 in
+    let neigh_l = List.rev_map (fun (neigh_info, _, _) -> neigh_info) neigh_l in
+    let tlv_l = [Neighbour(neigh_l)] in
+    send_pack_l sock [make_neighbourg src_ip src_id] tlv_l
+  |Neighbour(neigh_l) ->
+    List.iter
+      (fun neigh_info -> host_pot_neigh := (neigh_info, None, None)::(!host_pot_neigh))
+      neigh_l
+  |Data(seqno, id, tlv_data_l) -> assert false
+  |IHave(seqno, id) -> assert false
+  |TLV_Data(data_type, data) -> ()
 ;;
 
-let handle_pack src_ip src_id body t =
-  update_uni_neigh src_ip t;
-  update_sym_neigh src_ip body t
+let handle_pack sock src_ip src_id port body t =
+  update_uni_neigh src_ip src_id port t
+;;
+
+let maintain_data_tbl t =
+  let curr_t = Sys.time () in
+  if curr_t >= t +. timeout_data_maintain then
+    host_data_tbl :=
+      List.find_all
+        (fun (id, seqno, data, t_data) -> curr_t < t_data +. timeout_data)
+        !host_data_tbl
 ;;
 
 let recv_service sock =
@@ -303,7 +371,7 @@ let recv_service sock =
     let t = Sys.time () in
     let src_ip = string_of_inet_addr addr in
     let (src_id, body) = interpret_pack pack in
-    handle_pack src_ip src_id body t
+    handle_pack sock src_ip src_id port body t
   |_ -> assert false
 ;;
 
