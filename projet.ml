@@ -8,6 +8,8 @@ open Unix;;
 
 exception Paquet_Non_Conforme of string;;
 
+(* Type Definition *)
+
 type id_pair = string;;
 type seqno = int;;
 type neigbour_info = id_pair * string * int;; (* ID * IP * Port *)
@@ -24,6 +26,10 @@ type tlv_type =
   |TLV_Data of int * string
 ;;
 
+(***********)
+
+(* Constant Defintion *)
+
 let port_protocol = 1212;;
 let udp_max_len = 5000;;
 let timeout_empty = 30.0;;
@@ -34,6 +40,8 @@ let timeout_sym_neigh = 150.0;;
 let timeout_sym_neigh_IHU = 300.0;;
 let timeout_data_maintain = 600.0;;
 let timeout_data = 2100.0;;
+let timeout_inondation_send = 3.0;;
+let timeout_inondation = 11.0;;
 
 let char_of = char_of_int;;
 
@@ -50,13 +58,22 @@ let host_id = Bytes.of_string "AAAAAAAA";;
 
 let host_seqno = ref 0;;
 
-let host_data = ref ("ASSOUAD");;
+let host_data = ref (TLV_Data(32, "ASSOUAD"));;
 
-let host_data_tbl = ref [(host_id, !host_seqno, !host_data, Sys.time ())];;
+let host_data_tbl = ref [(host_id, !host_seqno, [!host_data], Sys.time ())];;
 
 let host_pot_neigh : neighbour list ref = ref [((host_id, "81.194.27.155", port_protocol), None, None)];;
 let host_uni_neigh : neighbour list ref = ref [];;
 let host_sym_neigh : neighbour list ref = ref [];;
+
+let inondation_in_process = ref [];;
+
+(***********)
+
+let timeout t t_timeout =
+  let curr_t = Sys.time () in
+  abs_float (curr_t -. t) >= t_timeout
+;;
 
 let is_in_neigh ip neigh_l = List.exists (fun ((_, ip_neigh, _), _, _) -> ip_neigh = ip) neigh_l;;
 let remove_neigh ip id port neigh_l =
@@ -69,25 +86,23 @@ let remove_neigh ip id port neigh_l =
 let update_neigh ip id port t1 t2 neigh_l = ((id, ip, port), t1, t2)::(remove_neigh ip id port neigh_l);;
 
 let maintain_uni_neigh () =
-  let curr_t = Sys.time () in
   host_uni_neigh :=
     List.find_all
       (fun (ip_neigh, t1, t2) ->
         match t1 with
-        |Some(neigh_t) -> curr_t <= neigh_t +. timeout_uni_neigh
+        |Some(neigh_t) -> not (timeout neigh_t timeout_uni_neigh)
         |_ -> false)
       !host_uni_neigh
 ;;
 
 let maintain_sym_neigh () =
-  let curr_t = Sys.time () in
   host_sym_neigh :=
     List.find_all
       (fun (ip_neigh, t1, t2) ->
         match t1, t2 with
         |Some(neigh_t), Some(neigh_t_IHU) ->
-          curr_t <= neigh_t +. timeout_sym_neigh &&
-          curr_t <= neigh_t_IHU +. timeout_sym_neigh_IHU
+          not (timeout neigh_t timeout_sym_neigh) &&
+          not (timeout neigh_t_IHU timeout_sym_neigh_IHU)
         |_ -> false)
       !host_sym_neigh
 ;;
@@ -233,7 +248,7 @@ let rec interpret_body pack pos pack_len =
           aux (pos+10) ((IHU(id_pair))::out)
         |3 -> aux (pos+2+tlv_len) (Neighbour_Request::out)
         |4 ->
-          if tlv_len mod 28 <> 0 then
+          if tlv_len mod 26 <> 0 then
             raise (Paquet_Non_Conforme(sprintf "Taille TLV Neighbours non valide : %d mod <> 0" tlv_len));
           let neigh_l = ref [] in
           let compt = ref 0 in
@@ -241,7 +256,7 @@ let rec interpret_body pack pos pack_len =
             let id_pair = Bytes.sub_string pack (pos+2+ !compt) 8 in
             let ip_pair = Bytes.sub_string pack (pos+2+ !compt+8) 16 in
             let port_pair = make_int_from_bytes pack (pos+2+ !compt+24) 2 in
-            compt := !compt + 28;
+            compt := !compt + 26;
             neigh_l := ((id_pair, ip_pair, port_pair)::(!neigh_l))
           done;
           aux (pos+2+tlv_len) ((Neighbour(!neigh_l))::out)
@@ -274,9 +289,45 @@ let interpret_pack pack =
     (src_id, interpret_body pack 12 pack_len)
 ;;
 
+(***********)
 
 (* MAIN *)
 
+let init_inondation seqno id data_l =
+  let curr_t = Sys.time () in
+  inondation_in_process := (seqno, id, data_l, !host_sym_neigh, curr_t, curr_t)::(!inondation_in_process)
+;;
+
+let remove_from_inondation seqno id data_l neigh_l t_init t_send src_id =
+  let neigh_l = List.filter (fun ((id', _, _), _, _) -> id' <> src_id) neigh_l in
+  inondation_in_process := List.filter (fun (_, id', _, _, _, _) -> id' <> id) !inondation_in_process;
+  inondation_in_process := (seqno, id, data_l, neigh_l, t_init, t_send)::(!inondation_in_process)
+;;
+
+let inondation_step sock =
+  inondation_in_process :=
+    List.rev_map
+      (fun (seqno, id, data_l, neigh_l, t_init, t_send) ->
+        if timeout t_send timeout_inondation_send then begin
+          send_pack_l sock neigh_l [Data(seqno, id, data_l)];
+          (seqno, id, data_l, neigh_l, t_init, Sys.time ())
+        end else
+          (seqno, id, data_l, neigh_l, t_init, t_send))
+      !inondation_in_process
+;;
+
+let maintain_inondation () =
+  inondation_in_process :=
+    List.filter
+      (fun (seqno, id, _, _, t_init, _) ->
+        if timeout t_init timeout_inondation then
+          true
+        else begin
+          printf "Inondation arretee par Timeout ==> Id : %s    Seqno : %d\n" id seqno;
+          false
+        end)
+      !inondation_in_process
+;;
 
 let send_empty_pack_service sock =
   send_pack_l sock !host_sym_neigh [];
@@ -295,24 +346,24 @@ let send_neighbour_request_service sock =
   send_pack_l sock [neigh] [Neighbour_Request]
 ;;
 
-let send_service sock t_empty t_IHU t_neigh_request =
+let send_service sock (t_empty, t_IHU, t_neigh_request) =
   let curr_t = Sys.time () in
   let new_t_empty =
-    if curr_t >= t_empty +. timeout_empty then begin
+    if timeout t_empty timeout_empty then begin
       send_empty_pack_service sock;
       curr_t
     end else
       t_empty
   in
   let new_t_IHU =
-    if curr_t >= t_IHU +. timeout_IHU then begin
+    if timeout t_IHU timeout_IHU then begin
       send_IHU_service sock;
       curr_t
     end else
       t_IHU
   in
   let new_t_neigh_request =
-    if curr_t >= t_neigh_request +. timeout_neighbour_request && List.length !host_pot_neigh < 5 then begin
+    if timeout t_neigh_request timeout_neighbour_request && List.length !host_pot_neigh < 5 then begin
       send_neighbour_request_service sock;
       curr_t
     end else
@@ -346,22 +397,45 @@ let handle_tlv sock src_ip src_id src_port tlv t =
     List.iter
       (fun neigh_info -> host_pot_neigh := (neigh_info, None, None)::(!host_pot_neigh))
       neigh_l
-  |Data(seqno, id, tlv_data_l) -> assert false
-  |IHave(seqno, id) -> assert false
+  |Data(seqno, id, tlv_data_l) -> begin
+    try
+      let (id, old_seqno, old_data, old_time) = List.find (fun (id', _, _, _) -> id' = id) !host_data_tbl in
+      if seqno > old_seqno then begin
+        host_data_tbl := List.find_all (fun (id', _, _, _) -> id' <> id) !host_data_tbl;
+        host_data_tbl := (id, seqno, tlv_data_l, Sys.time ())::(!host_data_tbl);
+        init_inondation seqno id tlv_data_l;
+        send_pack_l sock [((src_id, src_ip, src_port), None, None)] [IHave(seqno, id)]
+      end
+    with
+    |Not_found ->
+      host_data_tbl := (id, seqno, tlv_data_l, Sys.time ())::(!host_data_tbl);
+      init_inondation seqno id tlv_data_l;
+      send_pack_l sock [((src_id, src_ip, src_port), None, None)] [IHave(seqno, id)]
+  end
+  |IHave(seqno, id) -> begin
+    try
+      let (_, _, data_l, neigh_l, t_init, t_send) =
+        List.find
+          (fun (seqno', id', data_l, neigh_l, t_init, t_send) -> id' = id && seqno' <= seqno)
+          !inondation_in_process
+      in
+      remove_from_inondation seqno id data_l neigh_l t_init t_send src_id
+    with
+    |Not_found -> ()
+  end
   |TLV_Data(data_type, data) -> ()
 ;;
 
 let handle_pack sock src_ip src_id port body t =
-  update_uni_neigh src_ip src_id port t
+  update_uni_neigh src_ip src_id port t;
+  List.iter (fun tlv -> handle_tlv sock src_ip src_id port tlv t) body
 ;;
 
-let maintain_data_tbl t =
-  let curr_t = Sys.time () in
-  if curr_t >= t +. timeout_data_maintain then
-    host_data_tbl :=
-      List.find_all
-        (fun (id, seqno, data, t_data) -> curr_t < t_data +. timeout_data)
-        !host_data_tbl
+let maintain_data_tbl () =
+  host_data_tbl :=
+    List.find_all
+      (fun (id, seqno, data, t_data) -> not (timeout t_data timeout_data))
+      !host_data_tbl
 ;;
 
 let recv_service sock =
@@ -373,6 +447,22 @@ let recv_service sock =
     let (src_id, body) = interpret_pack pack in
     handle_pack sock src_ip src_id port body t
   |_ -> assert false
+;;
+
+let run_protocol =
+  let curr_t = Sys.time () in
+  let sock = socket PF_INET SOCK_DGRAM 0 in
+  setsockopt sock SO_REUSEADDR true;
+  let rec protocol_loop sock t_send =
+    maintain_neigh ();
+    maintain_data_tbl ();
+    maintain_inondation ();
+    inondation_step sock;
+    let new_t_send = send_service sock t_send in
+    recv_service sock;
+    protocol_loop sock new_t_send
+  in
+  protocol_loop sock (curr_t, curr_t, curr_t)
 ;;
 
 let _ =
