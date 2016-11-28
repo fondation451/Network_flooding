@@ -58,6 +58,21 @@ let print_tlv_l tlv_l =
   List.iter print_tlv tlv_l
 ;;
 
+let read_file f =
+  let out = Buffer.create 2 in
+  let fd = open_in f in
+  let rec aux () =
+    try
+      let new_line = input_line fd in
+      Buffer.add_string out new_line;
+      aux ()
+    with
+    |End_of_file -> close_in fd
+  in
+  aux ();
+  Buffer.contents out
+;;
+
 (***********)
 
 (* Constant Definition *)
@@ -78,15 +93,19 @@ let timeout_inondation_host_data = 1800.0;;
 
 let char_of = char_of_int;;
 
+let data_file = "data.txt";;
+
 let ip_prof = "81.194.27.155";;
 
-let host_id = Bytes.of_string "CAAAAAAA";;
+let host_id = Bytes.of_string "NASSOUAD";;
 
-let host_seqno = ref 20;;
+let host_seqno = ref 1;;
 
-let host_data = ref (TLV_Data(32, "ca degage !"));;
+let host_data = ref (TLV_Data(32, read_file data_file));;
 
-let host_data_tbl = ref [(host_id, !host_seqno, [!host_data], time ())];;
+let host_data_last_mod = ref ((stat data_file).st_mtime);;
+
+let host_data_tbl = ref [];;
 
 let bootstrap_neigh = (("", ip_prof, port_protocol), None, None);;
 
@@ -125,6 +144,7 @@ let print_state () =
   printf "\nNEIGH SYM : ";
   print_neigh_l !host_sym_neigh;
   printf "\nDATA TABLE : \n";
+  printf "(%s, %d, " host_id !host_seqno; print_tlv_l [!host_data]; printf ")\n";
   List.iter (fun (id, seqno, tlv_l, t) -> printf "(%s, %d, %f, " id seqno t; print_tlv_l tlv_l; printf ")\n") !host_data_tbl;
   printf "\nINONDATION : \n";
   List.iter
@@ -337,11 +357,9 @@ let make_int_from_bytes b i l =
   let out = ref 0 in
   let acc = ref 1 in
   for k = i to i+l-1 do
-    (*print_endline (sprintf "%d, " (int_of_char (Bytes.get b k)));*)
     out := !out * !acc + (int_of_char (Bytes.get b k));
     acc := !acc * 256
   done;
-  (*print_endline (sprintf "out = %d" !out);*)
   !out
 ;;
 
@@ -423,9 +441,6 @@ let rec send_pack_l sock neigh tlv_l =
     let ((id, ip, port), _, _) = h in
     let addr = inet_addr_of_string ip in
     let sin = ADDR_INET(addr, port) in
-    print_endline (sprintf "Envoie à Id : %s  IP : %s  port : %d" id ip port);
-    print_tlv_l tlv_l;
-    print_newline ();
     send_pack sock sin host_id tlv_l;
     send_pack_l sock t tlv_l
 ;;
@@ -488,8 +503,6 @@ let interpret_pack pack =
   else
     let pack_len = make_int_from_bytes pack 2 2 in
     let src_id = Bytes.sub_string pack 4 8 in
-    (*print_endline (sprintf "id : %s et len : %d" src_id pack_len);
-    print_endline (string_to_hex pack);*)
     (src_id, interpret_body pack 12 pack_len)
 ;;
 
@@ -585,8 +598,9 @@ let send_service sock (t_empty, t_IHU, t_neigh_request) =
   (new_t_empty, new_t_IHU, new_t_neigh_request)
 ;;
 
-let update_uni_neigh src_ip src_id src_port t =
+let update_uni_neigh sock src_ip src_id src_port t =
   if not (is_in_neigh src_ip !host_uni_neigh || is_in_neigh src_ip !host_sym_neigh) then begin
+    send_pack_l sock [make_neighbourg src_ip src_id] [IHU(src_id)];
     host_pot_neigh := remove_neigh src_ip src_id src_port !host_pot_neigh;
     host_uni_neigh := update_neigh_id src_ip src_id src_port (Some(t)) None !host_uni_neigh
   end
@@ -624,19 +638,21 @@ let handle_tlv sock src_ip src_id src_port tlv t =
           host_pot_neigh := update_neigh ip id port None None !host_pot_neigh)
       neigh_l
   |Data(seqno, id, tlv_data_l) -> begin
-    try
-      let (id, old_seqno, old_data, old_time) = List.find (fun (id', _, _, _) -> id' = id) !host_data_tbl in
-      if seqno > old_seqno then begin
-        host_data_tbl := List.find_all (fun (id', _, _, _) -> id' <> id) !host_data_tbl;
+    if id <> host_id then begin
+      try
+        let (id, old_seqno, old_data, old_time) = List.find (fun (id', _, _, _) -> id' = id) !host_data_tbl in
+        if seqno > old_seqno then begin
+          host_data_tbl := List.find_all (fun (id', _, _, _) -> id' <> id) !host_data_tbl;
+          host_data_tbl := (id, seqno, tlv_data_l, time ())::(!host_data_tbl);
+          init_inondation seqno id tlv_data_l;
+          send_pack_l sock [((src_id, src_ip, src_port), None, None)] [IHave(seqno, id)]
+        end
+      with
+      |Not_found ->
         host_data_tbl := (id, seqno, tlv_data_l, time ())::(!host_data_tbl);
         init_inondation seqno id tlv_data_l;
         send_pack_l sock [((src_id, src_ip, src_port), None, None)] [IHave(seqno, id)]
-      end
-    with
-    |Not_found ->
-      host_data_tbl := (id, seqno, tlv_data_l, time ())::(!host_data_tbl);
-      init_inondation seqno id tlv_data_l;
-      send_pack_l sock [((src_id, src_ip, src_port), None, None)] [IHave(seqno, id)]
+    end
   end
   |IHave(seqno, id) -> begin
     try
@@ -653,7 +669,7 @@ let handle_tlv sock src_ip src_id src_port tlv t =
 ;;
 
 let handle_pack sock src_ip src_id port body t =
-  update_uni_neigh src_ip src_id port t;
+  update_uni_neigh sock src_ip src_id port t;
   List.iter (fun tlv -> handle_tlv sock src_ip src_id port tlv t) body
 ;;
 
@@ -673,14 +689,20 @@ let recv_service sock =
       let t = time () in
       let src_ip = string_of_inet_addr addr in
       let (src_id, body) = interpret_pack pack in
-      print_state (); print_newline ();
-      print_endline (sprintf "Reception Id : %s et ip : %s" src_id src_ip);
-      print_tlv_l body;
-      print_newline (); print_newline ();
       handle_pack sock src_ip src_id port body t
     |_ -> assert false
   with
   |Unix_error(EAGAIN, _, _) -> ()
+;;
+
+let update_host_data () =
+  let file_stats = stat data_file in
+  if file_stats.st_mtime > !host_data_last_mod then begin
+    host_data_last_mod := file_stats.st_mtime;
+    host_data := TLV_Data(32, read_file data_file);
+    host_seqno := !host_seqno + 1;
+    init_inondation !host_seqno host_id [!host_data]
+  end
 ;;
 
 let run_protocol () =
@@ -691,7 +713,8 @@ let run_protocol () =
   bind sock (ADDR_INET(inet_addr_any, port_protocol));
   let t_inon = ref curr_t in
   let rec protocol_loop sock t_send =
-    (*print_state (); print_endline "";*)
+    print_state (); print_endline "";
+    update_host_data ();
     maintain_neigh ();
     maintain_data_tbl ();
     maintain_inondation ();
@@ -702,7 +725,6 @@ let run_protocol () =
       t_inon := time ();
       host_seqno := !host_seqno + 1;
       init_inondation !host_seqno host_id [!host_data];
-      (*print_state (); print_newline ();*)
     end;
     protocol_loop sock new_t_send
   in
